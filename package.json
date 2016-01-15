@@ -1,0 +1,22 @@
+{
+  "name": "character_extraction",
+  "version": "1.0.0",
+  "description": "Extracts characters from an image.",
+  "main": "main.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nateliu76/character_extraction"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/nateliu76/character_extraction/issues"
+  },
+  "homepage": "https://github.com/nateliu76/character_extraction",
+  "dependencies": {
+    "pngjs": "^2.2.0"
+  }
+}
