@@ -3,13 +3,26 @@ import Queue
 from PIL import Image
 
 '''
+Current flow
+  1. detect bubble
+  2. extract text from bubble
+  3. crop extra white border
+  4. apply threshold
+  5. divide space into boxes based on black pixels
+  6. further dissect boxes to deal with edge cases
+  7. repeat 5, 6 one more time
+  8. merge boxes to form squares
+
 TO DO:
-  1. better filtering so light colored parts don't get cropped off
-  2. clustering/grouping words into connected components?
-  3. Improve boxing for edge cases:
-    - first character/last character
-    - DP?
-  4. make comments, starting to forget lol
+  Possible improvements:
+    1. better filtering so light colored parts don't get cropped off
+    2. clustering/grouping nearby words into connected components
+    3. instead of using boxes, use vertical lines
+    
+    Notes on edge cases to improve for
+      1. multiple text regions in one bubble, this is the main one
+      2. punctuation marks
+  Make comments, starting to forget lol
 
 '''
 
@@ -33,8 +46,8 @@ MAX_BOX_SIZE = 40000
 directions = [(0, 1), (0, -1), (1, 0), (-1, 0)]
 matrix_bounds = None
 
-class Text_bubble():
-  def __init__(self, ymin, ymax, xmin, xmax, ylen, xlen, ratio, has_word, blk_pix_cnt):
+class Text_block():
+  def __init__(self, ymin, ymax, xmin, xmax, ylen, xlen, ratio, blk_pix_cnt):
     self.ymin = ymin
     self.ymax = ymax
     self.xmin = xmin
@@ -42,13 +55,12 @@ class Text_bubble():
     self.ylen = ylen
     self.xlen = xlen
     self.ratio = ratio
-    self.has_word = has_word
     self.blk_pix_cnt = blk_pix_cnt
     self.down = None
     self.right = None
     self.matched = False
     
-  def is_valid_box(self):
+  def is_valid_block(self):
     enough_blk_pix = self.blk_pix_cnt >= MIN_BLK_PIX
     box_size = self.ylen * self.xlen
     valid_size = box_size < MAX_BOX_SIZE and box_size > MIN_BOX_SIZE
@@ -56,13 +68,349 @@ class Text_bubble():
     
   def unpack(self):
     return (self.ymin, self.ymax, self.xmin, self.xmax, self.ylen, self.xlen,
-            self.ratio, self.has_word)
-    
-  def unpack_all(self):
-    return (self.ymin, self.ymax, self.xmin, self.xmax, self.ylen, self.xlen,
-            self.ratio, self.has_word, self.blk_pix_cnt)
+            self.ratio, self.blk_pix_cnt)
+            
+  def has_word(self):
+    return self.blk_pix_cnt > 0
+
+
+def mark_text_blocks(matrix, idx=''):
+  matrix_w_gaps = mark_gaps(matrix, idx)
+  blocks = convert_img_to_blocks(matrix_w_gaps)
+  processed_blocks = break_down_deformed_blocks(matrix_w_gaps, blocks)
   
-def tighten_bubble(matrix, idx=''):
+  if DBG:
+    boxes_img = [[100 if pix == -1 else pix for pix in row] for row in matrix_w_gaps]
+    write_blocks_to_img(boxes_img, processed_blocks)
+    print_image(boxes_img, 'bubbles_pre_merge')
+  
+  # merge blocks
+  final_blocks = merge_blocks_to_form_squares(matrix_w_gaps, processed_blocks)
+  
+  # draw blocks on clean bubble
+  if DBG:
+    merged_blocks_img = [list(x) for x in matrix]
+    write_blocks_to_img(merged_blocks_img, final_blocks)
+    print_image(merged_blocks_img, 'final_merged_blocks' + idx)
+  
+  return final_blocks
+  
+  
+def break_down_deformed_blocks(matrix_w_gaps, blocks):
+  # break blocks down further if necessary
+  for i in xrange(DISSECT_NUM):
+    for block in blocks:
+      if block.ratio <= DISSECT_RATIO_THRES:
+        mark_gaps_within_block(matrix_w_gaps, block)
+    blocks = convert_img_to_blocks(matrix_w_gaps, str(i))
+  return blocks
+  
+  
+def merge_blocks_to_form_squares(matrix_w_gaps, blocks):
+  mark_adj_blocks(blocks, matrix_w_gaps)
+  final_blocks = []
+  for block in blocks:
+    if block.matched or not block.has_word():
+      continue
+    if block.ratio < RATIO_THRES:
+      block = merge_w_nearby_blocks(block)
+    if block.is_valid_block():
+      final_blocks.append(block)
+  return final_blocks
+  
+  
+def mark_gaps(matrix, idx):
+  print 'marking gaps...'
+  matrix_w_gaps = [list(x) for x in matrix]
+  vert_has_word = [0] * len(matrix)
+  horz_has_word = [0] * len(matrix[0])
+  
+  for i, y in enumerate(matrix):
+    for j, x in enumerate(y):
+      if x <= BLACK_COLOR:
+        vert_has_word[i] = 1
+        horz_has_word[j] = 1
+        
+  for i in xrange(len(matrix)):
+    for j in xrange(len(matrix[0])):
+      if vert_has_word[i] == 0 or horz_has_word[j] == 0:
+        matrix_w_gaps[i][j] = -1
+  
+  if DBG:
+    gaps_marked = [list(x) for x in matrix]
+    for i in xrange(len(matrix)):
+      for j in xrange(len(matrix[0])):
+        if vert_has_word[i] == 0 or horz_has_word[j] == 0:
+          gaps_marked[i][j] = 100
+    print_image(gaps_marked, 'gaps_marked' + idx)
+    
+  return matrix_w_gaps
+
+  
+def mark_gaps_within_block(matrix, block):
+  ymin, ymax, xmin, xmax, ylen, xlen, ratio, blk_pix_cnt = block.unpack()
+  vert_has_word = [0] * ylen
+  horz_has_word = [0] * xlen
+  
+  for i in xrange(ymin, ymax + 1):
+    for j in xrange(xmin, xmax + 1):
+      if matrix[i][j] <= BLACK_COLOR and matrix[i][j] >= 0:
+        vert_has_word[i - ymin] = 1
+        horz_has_word[j - xmin] = 1
+        
+  if ylen > WORD_BREAK_MIN_LEN:
+    for i in xrange(ymin, ymax + 1):
+        if vert_has_word[i - ymin] == 0:
+          for j in xrange(xmin, xmax + 1):
+            matrix[i][j] = -1
+  
+  if xlen > WORD_BREAK_MIN_LEN:
+    for j in xrange(xmin, xmax + 1):
+        if horz_has_word[j - xmin] == 0:
+          for i in xrange(ymin, ymax + 1):
+            matrix[i][j] = -1
+  
+  
+def convert_img_to_blocks(matrix_w_gaps, idx=''):
+  processed = set()
+  blocks = []
+  for i, row in enumerate(matrix_w_gaps):
+    for j, pix in enumerate(row):
+      if pix != -1 and (i, j) not in processed:
+        block = get_block_parameters(matrix_w_gaps, i, j, processed)
+        blocks.append(block)
+      
+  if DBG:
+    boxes_img = [[100 if pix == -1 else pix for pix in row] for row in matrix_w_gaps]
+    write_blocks_to_img(boxes_img, blocks)
+    print_image(boxes_img, 'boxes_preliminary' + idx)
+      
+  return blocks
+  
+  
+def mark_adj_blocks(blocks, matrix_w_gaps):
+  regions = [[-1] * len(matrix_w_gaps[0]) for x in xrange(len(matrix_w_gaps))]
+  
+  # first pass, mark idx for different blocks
+  idx = 0
+  for block in blocks:
+    ymin, ymax, xmin, xmax, ylen, xlen, ratio, blk_pix_cnt = block.unpack()
+    for i in xrange(ymin, ymax + 1):
+      for j in xrange(xmin, xmax + 1):
+        regions[i][j] = idx
+    idx += 1
+  
+  # second pass, connect nodes/blocks
+  for block in blocks:
+    ymin, ymax, xmin, xmax, ylen, xlen, ratio, blk_pix_cnt = block.unpack()
+    ymid = (ymin + ymax) / 2
+    xmid = (xmin + xmax) / 2
+    # search right
+    right_idx = -1
+    for j in xrange(xmax + 1, len(matrix_w_gaps[0])):
+      if regions[ymid][j] != -1:
+        right_idx = regions[ymid][j]
+        break    
+    if right_idx != -1:
+      r_block = blocks[right_idx]
+      if r_block.ymax == block.ymax and r_block.ymin == block.ymin:
+        block.right = r_block
+    # search down
+    down_idx = -1
+    for i in xrange(ymax + 1, len(matrix_w_gaps)):
+      if regions[i][xmid] != -1:
+        down_idx = regions[i][xmid]
+        break    
+    if down_idx != -1:
+      d_blocks = blocks[down_idx]
+      if d_blocks.xmax == block.xmax and d_blocks.xmin == block.xmin:
+        block.down = d_blocks
+  
+  
+def merge_w_nearby_blocks(block):
+  ymin, ymax, xmin, xmax, ylen, xlen, ratio, \
+        blk_pix_cnt = block.unpack()
+  
+  if ylen > xlen:
+    r_block = block.right
+    for i in xrange(MAX_BOX_NUM):
+      if not r_block:
+        break
+      ymin1, ymax1, xmin1, xmax1, ylen1, xlen1, ratio1, \
+            blk_pix_cnt1 = r_block.unpack()
+      new_ratio = box_ratio(ylen, xlen + xmax1 - xmax)
+      if new_ratio > max(ratio, ratio1):
+        ratio = new_ratio
+        xlen += xmax1 - xmax
+        xmax = xmax1
+        blk_pix_cnt += blk_pix_cnt1
+        r_block.matched = True
+        r_block = r_block.right
+      else:
+        break
+  else:
+    d_block = block.down
+    for i in xrange(MAX_BOX_NUM):
+      if not d_block:
+        break
+      ymin1, ymax1, xmin1, xmax1, ylen1, xlen1, ratio1, \
+            blk_pix_cnt1 = d_block.unpack()
+      new_ratio = box_ratio(xlen, ylen + ymax1 - ymax)
+      if new_ratio > max(ratio, ratio1):
+        ratio = new_ratio
+        ylen += ymax1 - ymax
+        ymax = ymax1
+        blk_pix_cnt += blk_pix_cnt1
+        d_block.matched = True
+        d_block = d_block.down
+      else:
+        break
+  
+  final_block = Text_block(ymin, ymax, xmin, xmax, ylen, xlen, ratio,
+                      blk_pix_cnt)
+  return final_block
+
+
+def box_ratio(ylen, xlen):
+  return float(min(xlen, ylen)) / max(xlen, ylen)
+
+  
+def write_blocks_to_img(matrix, blocks):
+  for block in blocks:
+    ymin, ymax, xmin, xmax, ylen, xlen, ratio, blk_pix_cnt = block.unpack()
+    if block.has_word():
+      ystart = max(0, ymin - CHAR_MARGIN)
+      yend = min(len(matrix) - 1, ymax + CHAR_MARGIN)
+      xstart = max(0, xmin - CHAR_MARGIN)
+      xend = min(len(matrix[0]) - 1, xmax + CHAR_MARGIN)
+      for i in xrange(ystart, yend + 1):
+        matrix[i][xstart] = -1
+        matrix[i][xend] = -1
+      for j in xrange(xstart, xend + 1):
+        matrix[ystart][j] = -1
+        matrix[yend][j] = -1
+
+
+def get_block_parameters(matrix, ycoord, xcoord, processed):
+  blk_pix_cnt = 0
+  i = ycoord
+  while i + 1 < len(matrix) and (matrix[i][xcoord] != -1 
+                              or matrix[i + 1][xcoord] != -1):
+    j = xcoord
+    while j + 1 < len(matrix[0]) and (matrix[i][j] != -1 
+                                  or matrix[i][j + 1] != -1):
+      processed.add((i, j))
+      if matrix[i][j] <= BLACK_COLOR and matrix[i][j] >= 0:
+        blk_pix_cnt += 1
+      j += 1
+    i += 1
+  
+  ymin, ymax, xmin, xmax = ycoord, i - 1, xcoord, j - 1
+  ylen, xlen = i - ycoord, j - xcoord
+  ratio = box_ratio(ylen, xlen)
+  return Text_block(ymin, ymax, xmin, xmax, ylen, xlen, ratio, blk_pix_cnt)
+
+
+def search_for_bubble_near_coord(matrix, ycoord, xcoord):
+  print "Running BFS around (%d, %d) + flood fill..." % (ycoord, xcoord)
+  visited_white_pix = set()
+  q = Queue.Queue()
+  q.put((ycoord, xcoord))
+  visited = set()
+  visited.add((ycoord, xcoord))
+  boundary = [ycoord, ycoord, xcoord, xcoord]
+  
+  while not q.empty():
+    y, x = q.get()
+    if matrix[y][x] >= WHITE_COLOR:
+      flood_fill_white(matrix, visited_white_pix, y, x, boundary)
+      if len(visited_white_pix) > MIN_WHITE_PIX:
+        break
+    for i, j in directions:
+      next_pix = (y + i, x + j)
+      if in_bounds(next_pix, matrix_bounds) and next_pix not in visited:
+        q.put(next_pix)
+        visited.add(next_pix)
+    
+  bubble, blk_pix_cnt, offsets = extract_text(matrix, boundary, visited_white_pix)
+  if bubble and blk_pix_cnt >= BLACK_PIX_THRES:
+    mark_text_blocks(bubble)
+  else:
+    print 'No bubble found with given coordinates'
+
+    
+def search_img_for_bubbles(matrix):
+  final_img = [list(x) for x in matrix]
+  visited = set()
+  bubble_count = 0
+  print 'Searching for bubbles...'
+  for i, row in enumerate(matrix):
+    for j, pix in enumerate(row):
+      if pix >= WHITE_COLOR and (i, j) not in visited:
+        visited_white_pix = set()
+        boundary = [i, i, j, j]  # ymin, ymax, xmin, xmax
+        flood_fill_white(matrix, visited_white_pix, i, j, boundary)
+        visited |= visited_white_pix
+        ymin, ymax, xmin, xmax = boundary
+        if len(visited_white_pix) > MIN_WHITE_PIX:
+          bubble, blk_pix_cnt, offsets = extract_text(matrix, boundary, \
+                                          visited_white_pix, str(bubble_count))
+          yoffset, xoffset = offsets
+          if bubble and blk_pix_cnt >= BLACK_PIX_THRES:
+            print '\n%dth bubble found' % (bubble_count + 1)
+            print 'Bubble found at:', boundary
+            bubble_count += 1
+            blocks = mark_text_blocks(bubble, str(bubble_count))
+            write_to_final_img(final_img, blocks, ymin + yoffset, 
+                               xmin + xoffset, matrix)
+  print_image(final_img, 'final_img')
+  
+  
+def write_to_final_img(final_img, blocks, yoffset, xoffset, matrix):
+  for block in blocks:
+    ymin, ymax, xmin, xmax, ylen, xlen, ratio, blk_pix_count = block.unpack()
+    if block.has_word():
+      ystart = max(0, yoffset + ymin - CHAR_MARGIN)
+      yend = min(len(matrix) - 1, yoffset + ymax + CHAR_MARGIN)
+      xstart = max(0, xoffset + xmin - CHAR_MARGIN)
+      xend = min(len(matrix[0]) - 1, xoffset + xmax + CHAR_MARGIN)
+      for i in xrange(ystart, yend + 1):
+        final_img[i][xstart] = -1
+        final_img[i][xend] = -1
+      for j in xrange(xstart, xend + 1):
+        final_img[ystart][j] = -1
+        final_img[yend][j] = -1
+
+
+def extract_text(matrix, boundary, white_space, idx=''):
+  print "Running 2nd flood fill from corners"
+  
+  background_pixels = mark_background(white_space, boundary)
+  ymin, ymax, xmin, xmax = boundary
+  clean_bubble = [[255 if (i, j) in background_pixels else matrix[i][j] \
+                for j in xrange(xmin, xmax + 1)] \
+                for i in xrange(ymin, ymax + 1)]
+  apply_threshold(clean_bubble, WHITE_COLOR, BLACK_COLOR)
+  
+  if DBG:
+    test_image1 = [[matrix[i][j] \
+                  for j in xrange(xmin, xmax + 1)] \
+                  for i in xrange(ymin, ymax + 1)]
+    test_image2 = [[100 if (i, j) in white_space else matrix[i][j] 
+                  for j in xrange(xmin, xmax + 1)] \
+                  for i in xrange(ymin, ymax + 1)]
+    bord = [[0 if (i, j) in background_pixels else matrix[i][j] \
+                  for j in xrange(xmin, xmax + 1)] \
+                  for i in xrange(ymin, ymax + 1)]
+    print_image(test_image1, 'original_text_block' + idx)
+    print_image(test_image2, 'text_block' + idx)
+    print_image(bord, 'borders' + idx)
+    print_image(clean_bubble, 'clean_block' + idx)
+  
+  return tighten_bubble(clean_bubble, idx)
+
+  
+def tighten_bubble(matrix, idx):
   print "Cropping extra white space..."
   xmin = len(matrix[0])
   xmax = -1
@@ -97,488 +445,42 @@ def tighten_bubble(matrix, idx=''):
   tightened_bubble = [[matrix[i][j] for j in xrange(xmin, xmax + 1)] \
                       for i in xrange(ymin, ymax + 1)]
   return tightened_bubble, black_pix_count, (ymin, xmin)
-
   
-def find_border(matrix, white_space, boundary):
+  
+def mark_background(visited_white_pix, boundary):
   ymin, ymax, xmin, xmax = boundary
   border = set()
   # do flood fill from the boundaries
   for i in xrange(xmin, xmax + 1):
-    if (ymin, i) not in border and (ymin, i) not in white_space:
-      flood_fill_non_white(white_space, border, boundary, ymin, i)
-    if (ymax, i) not in border and (ymax, i) not in white_space:
-      flood_fill_non_white(white_space, border, boundary, ymax, i)
+    if (ymin, i) not in border and (ymin, i) not in visited_white_pix:
+      flood_fill_non_white(visited_white_pix, border, boundary, ymin, i)
+    if (ymax, i) not in border and (ymax, i) not in visited_white_pix:
+      flood_fill_non_white(visited_white_pix, border, boundary, ymax, i)
       
   for i in xrange(ymin, ymax + 1):
-    if (i, xmin) not in border and (i, xmin) not in white_space:
-      flood_fill_non_white(white_space, border, boundary, i, xmin)
-    if (i, xmax) not in border and (i, xmax) not in white_space:
-      flood_fill_non_white(white_space, border, boundary, i, xmax)  
+    if (i, xmin) not in border and (i, xmin) not in visited_white_pix:
+      flood_fill_non_white(visited_white_pix, border, boundary, i, xmin)
+    if (i, xmax) not in border and (i, xmax) not in visited_white_pix:
+      flood_fill_non_white(visited_white_pix, border, boundary, i, xmax)  
 
   return border
-  
-  
-def add_grid_lines(matrix, idx=''):
-  print 'Adding grid lines...'
-  matrix_with_gaps = find_gaps(matrix, idx)
-  boxes = process_boxes(matrix_with_gaps)
-  
-  if DBG:
-    merged_box_img = [list(x) for x in matrix]
-    for box in boxes:
-      if not box:
-        continue
-      ymin, ymax, xmin, xmax, ylen, xlen, ratio, has_word = box
-      if has_word:
-        ystart = max(0, ymin - CHAR_MARGIN)
-        yend = min(len(matrix) - 1, ymax + CHAR_MARGIN)
-        xstart = max(0, xmin - CHAR_MARGIN)
-        xend = min(len(matrix[0]) - 1, xmax + CHAR_MARGIN)
-        for i in xrange(ystart, yend + 1):
-          merged_box_img[i][xstart] = -1
-          merged_box_img[i][xend] = -1
-        for j in xrange(xstart, xend + 1):
-          merged_box_img[ystart][j] = -1
-          merged_box_img[yend][j] = -1
-    print_image(merged_box_img, 'boxes_merged' + idx)
-  return boxes
-  
-  
-def find_gaps(matrix, idx):
-  matrix_with_gaps = [list(x) for x in matrix]
-  vert_has_word = [0] * len(matrix)
-  horz_has_word = [0] * len(matrix[0])
-  
-  for i, y in enumerate(matrix):
-    for j, x in enumerate(y):
-      if x <= BLACK_COLOR:
-        vert_has_word[i] = 1
-        horz_has_word[j] = 1
-        
-  for i in xrange(len(matrix)):
-    for j in xrange(len(matrix[0])):
-      if vert_has_word[i] == 0 or horz_has_word[j] == 0:
-        matrix_with_gaps[i][j] = -1
-  
-  if DBG:
-    box_img_thick = [list(x) for x in matrix]
-    for i in xrange(len(matrix)):
-      for j in xrange(len(matrix[0])):
-        if vert_has_word[i] == 0 or horz_has_word[j] == 0:
-          box_img_thick[i][j] = 150
-    print_image(box_img_thick, 'thick grids' + idx)
-    
-  return matrix_with_gaps
-  
-'''
-TODO:
-add condition that dissecting only works if box is dissected into more than one piece
-
-'''
-def dissect_box(matrix, box):
-  ymin, ymax, xmin, xmax, ylen, xlen, ratio, has_word = box
-  vert_has_word = [0] * ylen
-  horz_has_word = [0] * xlen
-  
-  for i in xrange(ymin, ymax + 1):
-    for j in xrange(xmin, xmax + 1):
-      if matrix[i][j] <= BLACK_COLOR and matrix[i][j] >= 0:
-        vert_has_word[i - ymin] = 1
-        horz_has_word[j - xmin] = 1
-        
-  if ylen > WORD_BREAK_MIN_LEN:
-    for i in xrange(ymin, ymax + 1):
-        if vert_has_word[i - ymin] == 0:
-          for j in xrange(xmin, xmax + 1):
-            matrix[i][j] = -1
-  
-  if xlen > WORD_BREAK_MIN_LEN:
-    for j in xrange(xmin, xmax + 1):
-        if horz_has_word[j - xmin] == 0:
-          for i in xrange(ymin, ymax + 1):
-            matrix[i][j] = -1
-  
-  
-def convert_pix_to_boxes(matrix, idx=''):
-  # change image to 2d list of box dimensions
-  processed = set()
-  boxes = []
-  for i, row in enumerate(matrix):
-    for j, pix in enumerate(row):
-      if pix != -1 and (i, j) not in processed:
-        boxes.append(get_dimensions(matrix, i, j, processed))
-      
-  if DBG:
-    boxes_img = [[100 if pix == -1 else pix for pix in row] for row in matrix]
-    for box in boxes:
-      if not box:
-        continue
-      ymin, ymax, xmin, xmax, ylen, xlen, ratio, has_word = box
-      if has_word:
-        ystart = max(0, ymin - CHAR_MARGIN)
-        yend = min(len(matrix) - 1, ymax + CHAR_MARGIN)
-        xstart = max(0, xmin - CHAR_MARGIN)
-        xend = min(len(matrix[0]) - 1, xmax + CHAR_MARGIN)
-        for i in xrange(ystart, yend + 1):
-          boxes_img[i][xstart] = -2
-          boxes_img[i][xend] = -2
-        for j in xrange(xstart, xend + 1):
-          boxes_img[ystart][j] = -2
-          boxes_img[yend][j] = -2
-    print_image(boxes_img, 'boxes_preliminary' + idx)
-      
-  return boxes
-  
-  
-def process_boxes(matrix):
-  boxes = convert_pix_to_boxes(matrix)
-  
-  for i in xrange(DISSECT_NUM):
-    # break boxes down further
-    for box in boxes:
-      ratio = box[6]
-      if ratio <= DISSECT_RATIO_THRES:
-        dissect_box(matrix, box)
-    boxes = convert_pix_to_boxes(matrix, str(i))
-  
-  # put all boxes to Text_bubble class
-  bubbles = convert_boxes_to_bubbles(boxes, matrix)
-  
-  if DBG:
-    boxes_img = [[100 if pix == -1 else pix for pix in row] for row in matrix]
-    for bubble in bubbles:
-      ymin, ymax, xmin, xmax, ylen, xlen, ratio, has_word = bubble.unpack()
-      if has_word:
-        ystart = max(0, ymin - CHAR_MARGIN)
-        yend = min(len(matrix) - 1, ymax + CHAR_MARGIN)
-        xstart = max(0, xmin - CHAR_MARGIN)
-        xend = min(len(matrix[0]) - 1, xmax + CHAR_MARGIN)
-        for i in xrange(ystart, yend + 1):
-          boxes_img[i][xstart] = -2
-          boxes_img[i][xend] = -2
-        for j in xrange(xstart, xend + 1):
-          boxes_img[ystart][j] = -2
-          boxes_img[yend][j] = -2
-    print_image(boxes_img, 'bubbles_pre_merge')
-  
-  # merge bubbles
-  final_bubbles = []
-  for bubble in bubbles:
-    # print '\nraw bubble:', bubble.unpack_all()
-    # if already matched, skip
-    if bubble.matched or not bubble.has_word:
-      continue
-    # try and match with others if necessary
-    if bubble.ratio < RATIO_THRES:
-      bubble = merge_bubbles(bubble)
-    if bubble.is_valid_box():
-      final_bubbles.append(bubble)
-      # print 'bubble data:', bubble.unpack_all()
-    
-  return [bubble.unpack() for bubble in final_bubbles]
 
   
-def convert_boxes_to_bubbles(boxes, matrix):
-  regions = [[-1] * len(matrix[0]) for x in xrange(len(matrix))]
-  
-  # first pass, mark idx for different boxes, optimize later
-  bubbles = []
-  idx = 0
-  for box in boxes:
-    ymin, ymax, xmin, xmax, ylen, xlen, ratio, has_word = box
-    blk_pix_cnt = 0
-    for i in xrange(ymin, ymax + 1):
-      for j in xrange(xmin, xmax + 1):
-        if matrix[i][j] <= BLACK_COLOR and matrix[i][j] >= 0:
-          blk_pix_cnt += 1
-          
-    bubble = Text_bubble(ymin, ymax, xmin, xmax, ylen, xlen, 
-                         ratio, has_word, blk_pix_cnt)
-    for i in xrange(ymin, ymax + 1):
-      for j in xrange(xmin, xmax + 1):
-        regions[i][j] = idx
-    idx += 1
-    bubbles.append(bubble)
-  
-  # second pass, connect nodes/bubbles
-  for bubble1 in bubbles:
-    ymin, ymax, xmin, xmax, ylen, xlen, ratio, has_word = bubble1.unpack()
-    ymid = (ymin + ymax) / 2
-    xmid = (xmin + xmax) / 2
-    # search right
-    right_idx = -1
-    for j in xrange(xmax + 1, len(matrix[0])):
-      if regions[ymid][j] != -1:
-        right_idx = regions[ymid][j]
-        break    
-    if right_idx != -1:
-      r_bubble = bubbles[right_idx]
-      if r_bubble.ymax == bubble1.ymax and r_bubble.ymin == bubble1.ymin:
-        bubble1.right = r_bubble
-      
-    # search down
-    down_idx = -1
-    for i in xrange(ymax + 1, len(matrix)):
-      if regions[i][xmid] != -1:
-        down_idx = regions[i][xmid]
-        break    
-    if down_idx != -1:
-      d_bubble = bubbles[down_idx]
-      if d_bubble.xmax == bubble1.xmax and d_bubble.xmin == bubble1.xmin:
-        bubble1.down = d_bubble
-  return bubbles
-  
-  
-def merge_bubbles(bubble):
-  ymin, ymax, xmin, xmax, ylen, xlen, ratio, \
-        has_word, blk_pix_cnt = bubble.unpack_all()
-  
-  if bubble.ylen > bubble.xlen:
-    r_bubble = bubble.right
-    for i in xrange(MAX_BOX_NUM):
-      if not r_bubble:
-        break
-      ymin1, ymax1, xmin1, xmax1, ylen1, xlen1, ratio1, \
-            has_word1, blk_pix_cnt1 = r_bubble.unpack_all()
-      new_ratio = box_ratio(ylen, xlen + xmax1 - xmax)
-      if new_ratio > max(ratio, ratio1):
-        ratio = new_ratio
-        xlen += xmax1 - xmax
-        xmax = xmax1
-        has_word |= has_word1
-        blk_pix_cnt += blk_pix_cnt1
-        r_bubble.matched = True
-        r_bubble = r_bubble.right
-      else:
-        break
-  else:
-    d_bubble = bubble.down
-    for i in xrange(MAX_BOX_NUM):
-      if not d_bubble:
-        break
-      ymin1, ymax1, xmin1, xmax1, ylen1, xlen1, ratio1, \
-            has_word1, blk_pix_cnt1 = d_bubble.unpack_all()
-      new_ratio = box_ratio(xlen, ylen + ymax1 - ymax)
-      if new_ratio > max(ratio, ratio1):
-        ratio = new_ratio
-        ylen += ymax1 - ymax
-        ymax = ymax1
-        has_word |= has_word1
-        blk_pix_cnt += blk_pix_cnt1
-        d_bubble.matched = True
-        d_bubble = d_bubble.down
-      else:
-        break
-  
-  merged_bubble = Text_bubble(ymin, ymax, xmin, xmax, ylen, xlen, ratio, \
-                      has_word, blk_pix_cnt)
-  return merged_bubble
-  
-
-def merge_boxes(boxes, ycoord, xcoord, matched):
-  matched[ycoord][xcoord] = 1
-  curr_box = boxes[ycoord][xcoord]
-  ymin, ymax, xmin, xmax, ylen, xlen, ratio, has_word = curr_box
-  if ylen > xlen:
-    # merge boxes to the right
-    for j in xrange(xcoord + 1, min(xcoord + MAX_BOX_NUM, len(boxes[0]))):
-      next_box = boxes[ycoord][j]
-      ymin1, ymax1, xmin1, xmax1, ylen1, xlen1, ratio1, has_word1 = next_box
-      new_ratio = box_ratio(ylen, xlen + xmax1 - xmax)
-      if new_ratio > max(ratio, ratio1):
-        ratio = new_ratio
-        xlen += xmax1 - xmax
-        xmax = xmax1
-        has_word |= has_word1
-        matched[ycoord][j] = 1
-      else:
-        break
-  else:
-    # merge boxes below
-    for i in xrange(ycoord + 1, min(ycoord + MAX_BOX_NUM, len(boxes))):
-      next_box = boxes[i][xcoord]
-      ymin1, ymax1, xmin1, xmax1, ylen1, xlen1, ratio1, has_word1 = next_box
-      new_ratio = box_ratio(ylen + ymax1 - ymax, xlen)
-      if new_ratio > max(ratio, ratio1):
-        ratio = new_ratio
-        ylen += ymax1 - ymax
-        ymax = ymax1
-        has_word |= has_word1
-        matched[i][xcoord] = 1
-      else:
-        break
-  
-  return ymin, ymax, xmin, xmax, ylen, xlen, ratio, has_word
-
-
-def box_ratio(ylen, xlen):
-  return float(min(xlen, ylen)) / max(xlen, ylen)
-
-
-'''
-added condition in which words will be at least 2 pixels apart
-TODO:
-there is one case that will break this
-also, put black pix condition here
-
-'''
-def get_dimensions(matrix, ycoord, xcoord, processed):
-  has_word = False
-  i = ycoord
-  while i + 1 < len(matrix) and (matrix[i][xcoord] != -1 or matrix[i + 1][xcoord] != -1):
-    j = xcoord
-    while j + 1< len(matrix[0]) and (matrix[i][j] != -1 or matrix[i][j + 1] != -1):
-      processed.add((i, j))
-      if not has_word and matrix[i][j] <= BLACK_COLOR and matrix[i][j] >= 0:
-        has_word = True
-      j += 1
-    i += 1
-  
-  ymin, ymax, xmin, xmax = ycoord, i - 1, xcoord, j - 1
-  ylen, xlen = i - ycoord, j - xcoord
-  ratio = box_ratio(ylen, xlen)
-  return ymin, ymax, xmin, xmax, ylen, xlen, ratio, has_word
-  
-  
-def center_grids(hist):
-  run = 0
-  for i, pix in enumerate(hist):
-    if pix == 0:
-      run += 1
-      hist[i] = 1
-    if pix == 1 and run >= 3:
-      mid_idx = (i - run) + (run - 1) / 2
-      hist[mid_idx] = 0
-    if pix == 1:
-      run = 0
-      
-  if run >= 3:
-    mid_idx = -run / 2
-    hist[mid_idx] = 0
-
-    
-def search_for_bubble_around_coord(matrix, ycoord, xcoord):
-  print "Running BFS around (%d, %d) + flood fill..." % (ycoord, xcoord)
-  white_space = set()
-  q = Queue.Queue()
-  q.put((ycoord, xcoord))
-  visited = set()
-  visited.add((ycoord, xcoord))
-  boundary = [ycoord, ycoord, xcoord, xcoord]
-  
-  # need to handle errors
-  while not q.empty():
-    y, x = q.get()
-    if matrix[y][x] >= WHITE_COLOR:
-      flood_fill_white(matrix, white_space, y, x, boundary)
-      if len(white_space) > MIN_WHITE_PIX:
-        break
-    for i, j in directions:
-      next = (y + i, x + j)
-      if in_bounds(next, matrix_bounds) and next not in visited:
-        q.put(next)
-        visited.add(next)
-    
-  bubble, blk_pix_cnt, offsets = erase_border(matrix, boundary, white_space)
-  if bubble and blk_pix_cnt >= BLACK_PIX_THRES:
-    add_grid_lines(bubble)
-  else:
-    print 'No bubble found with given coordinates'
-
-    
-def search_img_for_bubbles(matrix):
-  final_img = [list(x) for x in matrix]
-  visited = set()
-  bubble_count = 0
-  print 'Searching for bubbles...'
-  for i, row in enumerate(matrix):
-    for j, pix in enumerate(row):
-      if pix >= WHITE_COLOR and (i, j) not in visited:
-        white_space = set()
-        boundary = [i, i, j, j]  # ymin, ymax, xmin, xmax
-        flood_fill_white(matrix, white_space, i, j, boundary)
-        visited |= white_space
-        ymin, ymax, xmin, xmax = boundary
-        # is_full_img = ymin == 0 and ymax == len(matrix) - 1 \
-                # and xmin == 0 and xmax == len(matrix[0]) - 1
-        is_full_img = False
-        if len(white_space) > MIN_WHITE_PIX and not is_full_img:
-          bubble, blk_pix_cnt, offsets = erase_border(matrix, boundary, \
-                                          white_space, str(bubble_count))
-          yoffset, xoffset = offsets
-          if bubble and blk_pix_cnt >= BLACK_PIX_THRES:
-            print '\n%dth bubble found' % (bubble_count + 1)
-            print 'Bubble found at:', boundary
-            bubble_count += 1
-            boxes = add_grid_lines(bubble, str(bubble_count))
-            print_to_final_img(final_img, boxes, ymin + yoffset, xmin + xoffset, matrix)
-            
-  print_image(final_img, 'final_img')
-  
-  
-def print_to_final_img(final_img, boxes, yoffset, xoffset, matrix):
-  for box in boxes:
-    if not box:
-      continue
-    ymin, ymax, xmin, xmax, ylen, xlen, ratio, has_word = box
-    if has_word:
-      ystart = max(0, yoffset + ymin - CHAR_MARGIN)
-      yend = min(len(matrix) - 1, yoffset + ymax + CHAR_MARGIN)
-      xstart = max(0, xoffset + xmin - CHAR_MARGIN)
-      xend = min(len(matrix[0]) - 1, xoffset + xmax + CHAR_MARGIN)
-      for i in xrange(ystart, yend + 1):
-        final_img[i][xstart] = -1
-        final_img[i][xend] = -1
-      for j in xrange(xstart, xend + 1):
-        final_img[ystart][j] = -1
-        final_img[yend][j] = -1
-
-
-def erase_border(matrix, boundary, white_space, idx=''):
-  ymin, ymax, xmin, xmax = boundary
-  
-  if DBG:
-    test_image1 = [[matrix[i][j] \
-                  for j in xrange(xmin, xmax + 1)] \
-                  for i in xrange(ymin, ymax + 1)]
-    test_image2 = [[100 if (i, j) in white_space else matrix[i][j] 
-                  for j in xrange(xmin, xmax + 1)] \
-                  for i in xrange(ymin, ymax + 1)]
-    print_image(test_image1, 'original_text_block' + idx)
-    print_image(test_image2, 'text_block' + idx)
-  
-  print "Running 2nd flood fill from corners"
-  border_pixels = find_border(matrix, white_space, boundary)
-  
-  bubble = [[255 if (i, j) in border_pixels else matrix[i][j] \
-                for j in xrange(xmin, xmax + 1)] \
-                for i in xrange(ymin, ymax + 1)]
-  apply_threshold(bubble, WHITE_COLOR, BLACK_COLOR)
-  
-  if DBG:
-    bord = [[0 if (i, j) in border_pixels else matrix[i][j] \
-                  for j in xrange(xmin, xmax + 1)] \
-                  for i in xrange(ymin, ymax + 1)]
-    print_image(bord, 'borders' + idx)
-    print_image(bubble, 'clean_block' + idx)
-  
-  return tighten_bubble(bubble)
-
-
-def flood_fill_non_white(white_space, border, boundary, ycoord, xcoord):
+def flood_fill_non_white(visited_white_pix, border, boundary, ycoord, xcoord):
   stack = [(ycoord, xcoord)]
   while stack:
     y, x = stack.pop()
     for i, j in directions:
-      next = (y + i, x + j)
-      if in_bounds(next, boundary) and next not in white_space and next not in border:
-        stack.append(next)
-        border.add(next)
+      next_pix = (y + i, x + j)
+      if in_bounds(next_pix, boundary) and next_pix not in visited_white_pix \
+                                       and next_pix not in border:
+        stack.append(next_pix)
+        border.add(next_pix)
     
   
-def flood_fill_white(matrix, white_space, ycoord, xcoord, boundary):
+def flood_fill_white(matrix, visited_white_pix, ycoord, xcoord, boundary):
   stack = [(ycoord, xcoord)]
-  white_space.add((ycoord, xcoord))
+  visited_white_pix.add((ycoord, xcoord))
   while stack:
     y, x = stack.pop()
     if y < boundary[0]:
@@ -592,11 +494,11 @@ def flood_fill_white(matrix, white_space, ycoord, xcoord, boundary):
     
     for i, j in directions:
       yn, xn = y + i, x + j
-      next = (yn, xn)
-      if in_bounds(next, matrix_bounds) and matrix[yn][xn] >= WHITE_COLOR \
-            and next not in white_space:
-        stack.append(next)
-        white_space.add(next)
+      next_pix = (yn, xn)
+      if in_bounds(next_pix, matrix_bounds) and matrix[yn][xn] >= WHITE_COLOR \
+            and next_pix not in visited_white_pix:
+        stack.append(next_pix)
+        visited_white_pix.add(next_pix)
 
         
 def in_bounds(coord, limits):
@@ -620,7 +522,8 @@ def print_image(matrix, fname):
   grn = (0, 255, 0)
   red = (255, 0, 0)
   
-  pixels2 = [grn if x == -1 else red if x == -2 else (x, x, x) for row in matrix for x in row]
+  pixels2 = [grn if x == -1 else red if x == -2 else (x, x, x) 
+              for row in matrix for x in row]
   
   im2 = Image.new("RGB", (len(matrix[0]), len(matrix)))
   im2.putdata(pixels2)
@@ -651,7 +554,7 @@ def main():
   if len(args) >= 3:
     DBG = 1
     x, y = int(args[1]), int(args[2])
-    search_for_bubble_around_coord(pixels, y, x)
+    search_for_bubble_near_coord(pixels, y, x)
   else:
     search_img_for_bubbles(pixels)
 
