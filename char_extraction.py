@@ -380,7 +380,7 @@ def search_img_for_bubbles(matrix):
             blocks = mark_text_blocks(bubble, str(bubble_count))
             write_to_final_img(final_img, blocks, ymin + yoffset,
                                xmin + xoffset, matrix)
-  print_image(final_img, 'final_img')
+  print_image(final_img, 'final_img', force=True)
 
 
 def write_to_final_img(final_img, blocks, yoffset, xoffset, matrix):
@@ -533,8 +533,8 @@ def apply_threshold(matrix, white_thres=255, black_thres=0):
         matrix[i][j] = 0
 
 
-def print_image(matrix, fname):
-  if DBG:
+def print_image(matrix, fname, force=False):
+  if DBG or force:
     blk = (0, 0, 0)           # color black
     wht = (255, 255, 255)     # color white
     grn = (0, 255, 0)
