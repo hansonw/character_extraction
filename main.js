@@ -1,5 +1,5 @@
 const fs = require('fs');
-const PNG = require('pngjs').PNG;
+const {readpng} = require('./lib/readpng');
 
 function processImage(img) {
   // Each pixel is stored as 4 bytes, RGBA
@@ -15,27 +15,21 @@ function processImage(img) {
   }
 }
 
-if (process.argv.length <= 2) {
-  console.error('No input file.');
-  return;
+async function main() {
+  if (process.argv.length <= 2) {
+    console.error('No input file.');
+    return;
+  }
+  try {
+    console.log('reading image..');
+    const img = await readpng(process.argv[2]);
+    console.log('processing...');
+    processImage(img);
+    img.pack().pipe(fs.createWriteStream('out.png'));
+    console.log('output written to out.png');
+  } catch (e) {
+    console.err(e);
+  }
 }
 
-console.log('Reading PNG file..');
-const png = new PNG({checkCRC: false});
-png
-  .on('parsed', function() {
-    try {
-      console.log('Processing image..');
-      processImage(png);
-      png.pack().pipe(fs.createWriteStream('out.png'));
-      console.log('Done!');
-    } catch (e) {
-      console.error(e);
-    }
-  })
-  .on('error', function(e) {
-    console.error(e);
-  });
-
-const data = fs.readFileSync(process.argv[2])
-png.write(data);
+main();

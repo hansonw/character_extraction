@@ -1,0 +1,19 @@
+{
+  "parser": "babel-eslint",
+  "env": {
+    "jasmine": true,
+  },
+  "extends": [
+    "airbnb",
+  ],
+  "rules": {
+    "eqeqeq": [2, "smart"],
+    "func-names": 0,
+    "new-cap": 0,
+    "no-console": 0,
+    "no-loop-func": 0,
+    "no-new": 0,
+    "object-curly-spacing": 0,
+    "yoda": 0,
+  }
+}
